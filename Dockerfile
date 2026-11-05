@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o loadtester main.go
 # Tahap 2: Jalankan di image Alpine dengan CA Certificates
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates curl
 
 WORKDIR /app
 
