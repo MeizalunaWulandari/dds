@@ -6,6 +6,7 @@ services:
     container_name: go_loadtester
     ports:
       - "8080:8080"
-    volumes:
-      - ./proxies.json:/app/proxies.json # Supaya file proxies.json bisa dibaca langsung dari host
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     restart: unless-stopped
