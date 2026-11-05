@@ -2,18 +2,16 @@
 FROM golang:1.23-alpine AS builder
 WORKDIR /app
 
-# Salin dependency dan source code
 COPY go.mod ./ 
 COPY main.go ./
 
-# Jika menggunakan go mod (inisialisasi go.mod terlebih dahulu jika belum ada)
-# RUN go mod init loadtester
-
-# Compile binary menjadi file static murni
 RUN CGO_ENABLED=0 GOOS=linux go build -o loadtester main.go
 
-# Tahap 2: Jalankan di image yang sangat ringan (Alpine)
+# Tahap 2: Jalankan di image Alpine dengan CA Certificates
 FROM alpine:latest
+
+# Install sertifikat SSL agar mendukung koneksi HTTPS eksternal
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
